@@ -1,4 +1,4 @@
-# paper-summary-automation
+# paper2scrapbox
 
 論文のWebページからPDFを取得し、OpenAI APIで日本語要約を生成してScrapboxの新規ページをブラウザで開く自動化スクリプトです。
 
@@ -80,3 +80,16 @@ python -m unittest -v test_integration_paper_summary
 ```
 
 ※ `RUN_NETWORK_TESTS=1` を付けない場合、統合テストはスキップされます。
+
+## Chrome拡張として使う
+
+リポジトリ直下の `extension/` ディレクトリにローカル専用のChrome拡張を同梱しています。ご自身のみが利用する前提のため、OpenAI APIキーはポップアップに入力し、`chrome.storage.local` に平文で保存されます（自己責任でご利用ください）。
+
+1. Chromeで `chrome://extensions/` を開き、右上で「デベロッパーモード」を有効化します。
+2. 「パッケージ化されていない拡張機能を読み込む」から本プロジェクトの `extension/` ディレクトリを指定します。
+3. 拡張アイコンをクリックし、論文ページURL（任意でPDF URL）、Scrapboxプロジェクト名、ScrapboxベースURL、OpenAI APIキー、モデル名を入力して「要約してScrapboxを開く」を押します。
+4. 成功すると要約済み内容が反映されたScrapboxページが新しいタブで開きます。処理状況はポップアップ下部のステータス欄で確認できます。
+
+### 注意
+- OpenAI APIとの通信はブラウザから直接行うため、APIキー流出リスクを理解したうえでご利用ください。
+- PDF取得や要約生成には数十秒要する場合があります。完了までポップアップを閉じないでください。
