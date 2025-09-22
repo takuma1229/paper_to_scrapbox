@@ -87,7 +87,7 @@ python -m unittest -v test_integration_paper_summary
 
 1. Chromeで `chrome://extensions/` を開き、右上で「デベロッパーモード」を有効化します。
 2. 「パッケージ化されていない拡張機能を読み込む」から本プロジェクトの `extension/` ディレクトリを指定します。
-3. 拡張アイコンをクリックし、論文ページURL（任意でPDF URL）、Scrapboxプロジェクト名、ScrapboxベースURL、OpenAI APIキー、モデル名を入力して「要約してScrapboxを開く」を押します。
+3. 拡張アイコンをクリックすると、現在アクティブなタブのURLが自動入力されます（論文ページ以外を開いている場合は必要に応じて書き換えてください）。任意で直接PDF URLを入力し、Scrapboxプロジェクト名、ScrapboxベースURL、OpenAI APIキー、モデル名を設定して「要約してScrapboxを開く」を押します。
 4. 成功すると要約済み内容が反映されたScrapboxページが新しいタブで開きます。処理状況はポップアップ下部のステータス欄で確認できます。
 
 ### 注意

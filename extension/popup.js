@@ -442,6 +442,31 @@ async function persistFormValues() {
   });
 }
 
+function prefillCurrentTabUrl() {
+  chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+    const maybeError = chrome.runtime.lastError;
+    if (maybeError) {
+      console.warn("Failed to get current tab", maybeError);
+      return;
+    }
+    if (!tabs || tabs.length === 0) {
+      return;
+    }
+    const tab = tabs[0];
+    if (!tab || !tab.url) {
+      return;
+    }
+    try {
+      const parsed = new URL(tab.url);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+        inputPageUrl.value = tab.url;
+      }
+    } catch (err) {
+      // ignore invalid URLs (e.g., chrome://)
+    }
+  });
+}
+
 formEl.addEventListener("submit", async (event) => {
   event.preventDefault();
   clearStatus();
@@ -478,6 +503,10 @@ formEl.addEventListener("submit", async (event) => {
   }
 });
 
-restoreFormValues().catch((err) => {
-  console.error("Failed to restore form values", err);
-});
+restoreFormValues()
+  .catch((err) => {
+    console.error("Failed to restore form values", err);
+  })
+  .finally(() => {
+    prefillCurrentTabUrl();
+  });
