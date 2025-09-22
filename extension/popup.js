@@ -11,6 +11,9 @@ const inputScrapboxBase = document.getElementById("scrapbox-base");
 const inputApiKey = document.getElementById("api-key");
 const inputModel = document.getElementById("model");
 
+const promptCache = {};
+const promptPromises = {};
+
 function logStatus(message) {
   const timestamp = new Date().toLocaleTimeString();
   statusEl.textContent += `[${timestamp}] ${message}\n`;
@@ -267,16 +270,10 @@ function extractTextFromResponse(responseObject) {
   return joined;
 }
 
-async function requestSummary(uploadedFileId, model, apiKey) {
-  const systemPrompt = "あなたは日本語で簡潔かつ正確な要約を書く研究支援アシスタントです。論文の主要な貢献を正確に伝え、整ったJSONのみを返してください。";
-  const userPrompt = `添付した論文PDFを読み、以下の要件を満たすJSONのみを出力してください。
-{
-  "title": 論文の正式タイトル（原文の言語を尊重し、先頭・末尾の空白を除去）, 
-  "summary": 日本語での要約。背景・目的、手法、主要な結果、考察/限界の順で4つの箇条書き（各2文以内）を含むMarkdown文字列。
-}
-箇条書きは必ず同じ行頭記号（例: '- ')を用いて統一してください。`;
+async function requestTextFromOpenAI(uploadedFileId, model, apiKey, userPrompt, description) {
+  const systemPrompt = "あなたは日本語で簡潔かつ正確に情報を伝える研究支援アシスタントです。指示された形式を厳守してください。";
 
-  logStatus("OpenAIへ要約生成をリクエスト...");
+  logStatus(`OpenAIへ${description}をリクエスト...`);
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
@@ -298,16 +295,56 @@ async function requestSummary(uploadedFileId, model, apiKey) {
           ]
         }
       ],
-      temperature: 0.2,
-      text: { format: { type: "json_object" } }
+      temperature: 0.2
     })
   });
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`要約リクエスト失敗: ${response.status} ${text}`);
+    throw new Error(`${description}リクエスト失敗: ${response.status} ${text}`);
   }
-  return response.json();
+  const responseObject = await response.json();
+  const text = extractTextFromResponse(responseObject).trim();
+  if (!text) {
+    throw new Error(`${description}の結果が空でした`);
+  }
+  return text;
+}
+
+async function requestTitle(uploadedFileId, model, apiKey) {
+  const prompt = await loadTitlePrompt();
+  const titleText = await requestTextFromOpenAI(
+    uploadedFileId,
+    model,
+    apiKey,
+    prompt,
+    "タイトル抽出"
+  );
+  return titleText.split(/\r?\n/)[0].trim();
+}
+
+async function requestSummaryText(uploadedFileId, model, apiKey) {
+  const prompt = await loadSummarizationPrompt();
+  const rawText = await requestTextFromOpenAI(
+    uploadedFileId,
+    model,
+    apiKey,
+    prompt,
+    "要約生成"
+  );
+  let summary = rawText.trim();
+  if (summary.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(summary);
+      const summaryField = (parsed.summary || "").trim();
+      if (summaryField) {
+        summary = summaryField;
+      }
+    } catch (err) {
+      console.warn("要約レスポンスのJSON解析に失敗しました", err);
+    }
+  }
+  return summary;
 }
 
 async function deleteUploadedFile(fileId, apiKey) {
@@ -372,37 +409,64 @@ async function runSummaryFlow(options) {
     throw new Error("OpenAIがファイルIDを返しませんでした");
   }
 
-  let responseObject;
+  let title;
+  let summary;
   try {
-    responseObject = await requestSummary(uploadedFileId, model, apiKey);
+    title = await requestTitle(uploadedFileId, model, apiKey);
+    if (!title) {
+      throw new Error("タイトルを取得できませんでした");
+    }
+    logStatus(`検出タイトル: ${title}`);
+
+    summary = await requestSummaryText(uploadedFileId, model, apiKey);
+    summary = summary.trim();
+    if (!summary) {
+      throw new Error("要約を取得できませんでした");
+    }
+    logStatus(`要約文字数: ${summary.length}`);
   } finally {
     deleteUploadedFile(uploadedFileId, apiKey);
   }
 
-  const rawText = extractTextFromResponse(responseObject);
-  logStatus("OpenAIレスポンス取得: JSON解析中...");
-
-  let parsed;
-  try {
-    parsed = JSON.parse(rawText);
-  } catch (err) {
-    throw new Error("OpenAIレスポンスをJSONとして解析できませんでした");
-  }
-
-  const title = (parsed.title || "").trim();
-  const summary = (parsed.summary || "").trim();
-  if (!title) {
-    throw new Error("OpenAIレスポンスにタイトルが含まれていません");
-  }
-  if (!summary) {
-    throw new Error("OpenAIレスポンスに要約が含まれていません");
-  }
-
-  logStatus(`検出タイトル: ${title}`);
   const scrapboxUrl = buildScrapboxUrl(scrapboxBase, project, title, summary);
   logStatus("Scrapboxページを開きます...");
   await openScrapboxTab(scrapboxUrl);
   logStatus("処理が完了しました");
+}
+
+async function loadPromptFile(filename) {
+  if (promptCache[filename]) {
+    return promptCache[filename];
+  }
+  if (!promptPromises[filename]) {
+    promptPromises[filename] = (async () => {
+      const url = chrome.runtime.getURL(filename);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const text = (await response.text()).trim();
+        if (!text) {
+          throw new Error("空のプロンプトファイル");
+        }
+        promptCache[filename] = text;
+        return text;
+      } catch (err) {
+        console.error(`Failed to load prompt: ${filename}`, err);
+        throw new Error("プロンプトの読み込みに失敗しました");
+      }
+    })();
+  }
+  return promptPromises[filename];
+}
+
+async function loadTitlePrompt() {
+  return loadPromptFile("title_prompt.txt");
+}
+
+async function loadSummarizationPrompt() {
+  return loadPromptFile("summarization_prompt.txt");
 }
 
 function setFormDisabled(disabled) {
@@ -510,3 +574,7 @@ restoreFormValues()
   .finally(() => {
     prefillCurrentTabUrl();
   });
+
+Promise.all([loadTitlePrompt(), loadSummarizationPrompt()]).catch((err) => {
+  console.error(err);
+});

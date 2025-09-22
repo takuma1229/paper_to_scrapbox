@@ -57,6 +57,10 @@ paper-summary "https://example.com/paper-page" your-scrapbox-project --model gpt
 ## 注意事項
 - OpenAI APIの利用料金が発生するため、必要に応じてトークン使用量を監視してください。
 
+## 要約プロンプトを変更する
+
+ルートディレクトリの `title_prompt.txt`（タイトル抽出）と `summarization_prompt.txt`（要約生成）が、CLIとChrome拡張で共有されるプロンプトです。内容を編集すると、次回の実行時に自動的に反映されます。`extension/` 以下の同名ファイルはシンボリックリンクで本体を参照しています。
+
 ## テストの実行
 
 ### 単体テスト
