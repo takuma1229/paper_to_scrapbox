@@ -3,3 +3,4 @@ __pycache__/
 .env
 .cache/
 .venv/
+.mypy_cache/
