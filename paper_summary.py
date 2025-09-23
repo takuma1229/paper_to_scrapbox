@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import webbrowser
+from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import quote, urljoin, urlparse, parse_qs
 
@@ -23,6 +24,31 @@ DEFAULT_HTTP_HEADERS = {
         "Chrome/126.0.0.0 Safari/537.36"
     )
 }
+
+TITLE_PROMPT_PATH = Path(__file__).with_name("title_prompt.txt")
+SUMMARY_PROMPT_PATH = Path(__file__).with_name("summarization_prompt.txt")
+
+
+def load_title_prompt() -> str:
+    """タイトル抽出に用いるプロンプトを読み込む。"""
+
+    try:
+        return TITLE_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except OSError as exc:  # pragma: no cover - ファイル欠如は運用時検知
+        raise RuntimeError(
+            f"タイトルプロンプトファイルを読み込めませんでした: {TITLE_PROMPT_PATH}"
+        ) from exc
+
+
+def load_summary_prompt() -> str:
+    """要約生成に用いるユーザープロンプトをテキストファイルから読み込む。"""
+
+    try:
+        return SUMMARY_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except OSError as exc:  # pragma: no cover - ファイル欠如は運用時検知
+        raise RuntimeError(
+            f"要約プロンプトファイルを読み込めませんでした: {SUMMARY_PROMPT_PATH}"
+        ) from exc
 
 
 def configure_logging(verbose: bool) -> None:
@@ -51,6 +77,11 @@ def find_pdf_url(page_url: str) -> str:
     logging.info("ページを取得します: %s", page_url)
 
     parsed_page = urlparse(page_url)
+
+    path_lower = (parsed_page.path or "").lower()
+    if path_lower.endswith(".pdf"):
+        logging.info("指定されたURLが既にPDFのため、そのまま利用します: %s", page_url)
+        return page_url
 
     def derive_direct_pdf_url() -> Optional[str]:
         """既知のURLパターンからPDFリンクを構築する。
@@ -264,57 +295,64 @@ def summarize_pdf_with_title(pdf_path: str, model: str) -> Tuple[str, str]:
         uploaded_file = client.files.create(file=pdf_file, purpose="assistants")
 
     system_prompt = (
-        "あなたは日本語で簡潔かつ正確な要約を書く研究支援アシスタントです。"
-        "論文の主要な貢献を正確に伝え、整ったJSONのみを返してください。"
-    )
-    user_prompt = (
-        "添付した論文PDFを読み、以下の要件を満たすJSONのみを出力してください。\n"
-        "{\n"
-        "  \"title\": 論文の正式タイトル（原文の言語を尊重し、先頭・末尾の空白を除去）,\n"
-        "  \"summary\": 日本語での要約。背景・目的、手法、主要な結果、考察/限界の順で4つの箇条書き（各2文以内）を含むMarkdown文字列。\n"
-        "}\n"
-        "箇条書きは必ず同じ行頭記号（例: '- '）を用いて統一してください。"
+        "あなたは日本語で正確な論文の要約を書く研究支援アシスタントです。"
+        "論文の主要な貢献を正確に伝え、指示された形式を厳守してください。"
     )
 
-    logging.info("OpenAIに要約をリクエストします (%s)", model)
-    response = client.responses.create(
-        model=model,
-        input=[
-            {
-                "role": "system",
-                "content": [{"type": "input_text", "text": system_prompt}],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": user_prompt},
-                    {"type": "input_file", "file_id": uploaded_file.id},
-                ],
-            },
-        ],
-        temperature=0.2,
-        text={"format": {"type": "json_object"}},
-    )
+    def request_text(prompt: str, description: str) -> str:
+        logging.info("OpenAIに%sをリクエストします (%s)", description, model)
+        response = client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": system_prompt}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_file", "file_id": uploaded_file.id},
+                    ],
+                },
+            ],
+        )
+        raw_text = extract_text_from_response(response)
+        logging.debug("OpenAIの生テキスト (%s): %s", description, raw_text)
+        text = raw_text.strip()
+        if not text:
+            raise RuntimeError(f"OpenAIレスポンスに{description}が含まれていません")
+        return text
 
-    raw_text = extract_text_from_response(response)
-    logging.debug("OpenAIの生データ: %s", raw_text)
-
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError as exc:  # pragma: no cover - network dependency
-        raise RuntimeError("OpenAIレスポンスをJSONとして解析できませんでした") from exc
-
-    title = (parsed.get("title") or "").strip()
-    summary = (parsed.get("summary") or "").strip()
-
+    title_prompt = load_title_prompt()
+    title_text = request_text(title_prompt, "タイトル抽出")
+    title = title_text.splitlines()[0].strip()
     if not title:
-        raise RuntimeError("OpenAIレスポンスにタイトルが含まれていません")
-    if not summary:
-        raise RuntimeError("OpenAIレスポンスに要約が含まれていません")
-
+        raise RuntimeError("OpenAIからタイトルを取得できませんでした")
     logging.info("OpenAIが検出したタイトル: %s", title)
+
+    summary_prompt = load_summary_prompt()
+    summary_raw = request_text(summary_prompt, "要約生成")
+    summary_raw = summary_raw.strip()
+    if not summary_raw:
+        raise RuntimeError("OpenAIから要約を取得できませんでした")
+
+    summary = summary_raw
+    if summary_raw.startswith("{"):
+        try:
+            parsed_summary = json.loads(summary_raw)
+        except json.JSONDecodeError:
+            logging.warning("要約レスポンスをJSON解析できませんでした。生テキストを使用します。")
+        else:
+            summary_field = (parsed_summary.get("summary") or "").strip()
+            if summary_field:
+                summary = summary_field
+            parsed_title = (parsed_summary.get("title") or "").strip()
+            if parsed_title and parsed_title != title:
+                logging.info("要約レスポンス内タイトル: %s", parsed_title)
+
     logging.info("OpenAIから受信した要約の文字数: %d", len(summary))
-    logging.info(f"要約:\n{summary}")
+    logging.info("要約:\n%s", summary)
 
     logging.debug("アップロード済みファイルを削除します: %s", uploaded_file.id)
     client.files.delete(uploaded_file.id)

@@ -59,6 +59,15 @@ class FindPdfUrlTests(unittest.TestCase):
 
         self.assertEqual(pdf_url, "https://example.org/downloads/paper_v2.pdf")
 
+    def test_returns_same_url_when_page_url_is_pdf(self) -> None:
+        url = "https://aclanthology.org/2025.acl-long.192.pdf"
+
+        with patch("paper_summary.requests.get") as mocked_get:
+            pdf_url = find_pdf_url(url)
+
+        mocked_get.assert_not_called()
+        self.assertEqual(pdf_url, url)
+
 
 if __name__ == "__main__":
     unittest.main()

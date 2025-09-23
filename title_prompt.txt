@@ -1,0 +1,7 @@
+添付した論文PDFから正式な論文タイトル・会議名 (略称)・出版年を抽出し、余計な説明や引用符を付けずに1行で出力してください。
+タイトルは原文の言語を保ち、前後の空白は除去してください。
+
+例えば、以下のような出力をして下さい。
+
+Attention is All You Need (NIPS 2017)
+Mission: Impossible Language Models (ACL 2024)
