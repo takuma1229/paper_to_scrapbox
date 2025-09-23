@@ -295,7 +295,6 @@ async function requestTextFromOpenAI(uploadedFileId, model, apiKey, userPrompt, 
           ]
         }
       ],
-      temperature: 0.2
     })
   });
 

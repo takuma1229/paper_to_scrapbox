@@ -311,7 +311,6 @@ def summarize_pdf_with_title(pdf_path: str, model: str) -> Tuple[str, str]:
                     ],
                 },
             ],
-            temperature=0.2,
         )
         raw_text = extract_text_from_response(response)
         logging.debug("OpenAIの生テキスト (%s): %s", description, raw_text)
