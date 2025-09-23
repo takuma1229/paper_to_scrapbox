@@ -78,6 +78,11 @@ def find_pdf_url(page_url: str) -> str:
 
     parsed_page = urlparse(page_url)
 
+    path_lower = (parsed_page.path or "").lower()
+    if path_lower.endswith(".pdf"):
+        logging.info("指定されたURLが既にPDFのため、そのまま利用します: %s", page_url)
+        return page_url
+
     def derive_direct_pdf_url() -> Optional[str]:
         """既知のURLパターンからPDFリンクを構築する。
 
@@ -290,7 +295,7 @@ def summarize_pdf_with_title(pdf_path: str, model: str) -> Tuple[str, str]:
         uploaded_file = client.files.create(file=pdf_file, purpose="assistants")
 
     system_prompt = (
-        "あなたは日本語で簡潔かつ正確な要約を書く研究支援アシスタントです。"
+        "あなたは日本語で正確な論文の要約を書く研究支援アシスタントです。"
         "論文の主要な貢献を正確に伝え、指示された形式を厳守してください。"
     )
 

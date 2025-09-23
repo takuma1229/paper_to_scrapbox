@@ -44,6 +44,24 @@
         background-color: #94a3b8;
         cursor: progress;
       }
+      #job-state {
+        font-size: 12px;
+        margin-top: 8px;
+        margin-bottom: 4px;
+        min-height: 16px;
+      }
+      #job-state.state-running {
+        color: #0b7285;
+      }
+      #job-state.state-success {
+        color: #2b8a3e;
+      }
+      #job-state.state-error {
+        color: #c92a2a;
+      }
+      #job-state.state-idle {
+        color: #334155;
+      }
       #status {
         font-size: 12px;
         line-height: 1.4;
@@ -95,6 +113,7 @@
       </div>
       <button type="submit">要約してScrapboxを開く</button>
     </form>
+    <div id="job-state">準備完了</div>
     <div id="status" aria-live="polite"></div>
     <script src="popup.js"></script>
   </body>
