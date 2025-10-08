@@ -7,6 +7,7 @@ const inputScrapboxBase = document.getElementById("scrapbox-base");
 const inputApiKey = document.getElementById("api-key");
 const inputModel = document.getElementById("model");
 const stateEl = document.getElementById("job-state");
+const cancelButton = document.getElementById("cancel-button");
 
 let currentJob = null;
 
@@ -32,6 +33,16 @@ function renderJob(job) {
   currentJob = job || null;
   const logs = job && Array.isArray(job.logs) ? job.logs : [];
   statusEl.textContent = logs.map(formatLog).join("\n");
+
+  if (cancelButton) {
+    const running = job && job.status === "running";
+    const cancelRequested = running && job.cancelRequested;
+    cancelButton.hidden = !running;
+    cancelButton.disabled = !running || cancelRequested;
+    cancelButton.textContent = cancelRequested
+      ? "中断を処理しています..."
+      : "要約を中断する";
+  }
 
   const status = job ? job.status : null;
   if (!job) {
@@ -202,6 +213,30 @@ formEl.addEventListener("submit", async (event) => {
     setFormDisabled(false);
   }
 });
+
+if (cancelButton) {
+  cancelButton.addEventListener("click", async () => {
+    cancelButton.disabled = true;
+    cancelButton.textContent = "中断を処理しています...";
+    updateState("中断要求を送信しています...", "state-running");
+    try {
+      const response = await sendMessage({ type: "cancel-summary" });
+      if (!response || !response.ok) {
+        const message = (response && response.error) || "中断要求を送信できませんでした";
+        statusEl.textContent = message;
+        updateState("エラー", "state-error");
+        cancelButton.disabled = false;
+        cancelButton.textContent = "要約を中断する";
+      }
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err);
+      statusEl.textContent = message;
+      updateState("エラー", "state-error");
+      cancelButton.disabled = false;
+      cancelButton.textContent = "要約を中断する";
+    }
+  });
+}
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message && message.type === "job-update") {

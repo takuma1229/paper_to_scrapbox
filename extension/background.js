@@ -4,8 +4,10 @@ const DEFAULT_HEADERS = {
 
 const JOB_STORAGE_KEY = "paper_summary_current_job";
 const LOG_LIMIT = 200;
+const DEFAULT_CANCEL_MESSAGE = "ユーザーが処理を中断しました";
 
 let currentJob = null;
+let currentJobAbortController = null;
 const promptCache = {};
 const promptPromises = {};
 
@@ -39,6 +41,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       finishedAt: null,
       error: null,
       result: null,
+      cancelRequested: false,
+      cancelReason: null,
       context: {
         pageUrl,
         pdfUrl: payload.pdfUrl || null,
@@ -49,11 +53,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
     };
 
+    currentJobAbortController = new AbortController();
+
     (async () => {
       try {
         await commitJob();
         await pushLog(jobId, "処理を開始しました");
-        await runSummaryFlow({ ...payload }, jobId);
+        await runSummaryFlow({ ...payload }, jobId, currentJobAbortController.signal);
       } catch (err) {
         const messageText = err instanceof Error ? err.message : String(err);
         console.error("Unexpected failure while running summary flow", err);
@@ -71,8 +77,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  if (message.type === "cancel-summary") {
+    if (!currentJob || currentJob.status !== "running") {
+      sendResponse({ ok: false, error: "進行中の処理はありません" });
+      return;
+    }
+    if (currentJob.cancelRequested) {
+      sendResponse({ ok: false, error: "既に中断要求を受け付けています" });
+      return;
+    }
+    currentJob.cancelRequested = true;
+    currentJob.cancelReason = DEFAULT_CANCEL_MESSAGE;
+    const jobId = currentJob.id;
+    (async () => {
+      await commitJob();
+      await pushLog(jobId, "ユーザーが処理の中断を要求しました");
+      if (currentJobAbortController) {
+        try {
+          currentJobAbortController.abort();
+        } catch (err) {
+          console.warn("Failed to abort current job", err);
+        }
+      }
+    })();
+    sendResponse({ ok: true });
+    return;
+  }
+
   if (message.type === "clear-status") {
     currentJob = null;
+    currentJobAbortController = null;
     chrome.storage.local.remove(JOB_STORAGE_KEY).finally(() => {
       broadcastJobUpdate();
     });
@@ -81,7 +115,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-async function runSummaryFlow(options, jobId) {
+function createAbortError(message) {
+  const error = new Error(message || DEFAULT_CANCEL_MESSAGE);
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error) {
+  if (!error) {
+    return false;
+  }
+  if (error.name === "AbortError") {
+    return true;
+  }
+  if (typeof DOMException !== "undefined" && error instanceof DOMException && error.name === "AbortError") {
+    return true;
+  }
+  return false;
+}
+
+function throwIfCancelled(jobId, abortSignal) {
+  if (abortSignal && abortSignal.aborted) {
+    throw createAbortError(DEFAULT_CANCEL_MESSAGE);
+  }
+  if (!currentJob || currentJob.id !== jobId) {
+    return;
+  }
+  if (currentJob.cancelRequested) {
+    throw createAbortError(currentJob.cancelReason || DEFAULT_CANCEL_MESSAGE);
+  }
+}
+
+async function runSummaryFlow(options, jobId, abortSignal) {
   try {
     const {
       pageUrl,
@@ -91,6 +156,8 @@ async function runSummaryFlow(options, jobId) {
       model,
       apiKey
     } = options;
+
+    throwIfCancelled(jobId, abortSignal);
 
     let resolvedPdfUrl = null;
     if (pdfUrl && pdfUrl.trim()) {
@@ -106,55 +173,72 @@ async function runSummaryFlow(options, jobId) {
         await pushLog(jobId, "ページURL自体がPDFのため、そのまま使用します");
       } else {
         await pushLog(jobId, "PDFリンクを解析しています...");
-        resolvedPdfUrl = await findPdfUrl(jobId, pageUrl);
+        throwIfCancelled(jobId, abortSignal);
+        resolvedPdfUrl = await findPdfUrl(jobId, pageUrl, abortSignal);
         await pushLog(jobId, `PDF URLを推定しました: ${resolvedPdfUrl}`);
       }
     }
 
-    const { file, bufferLength } = await downloadPdf(resolvedPdfUrl, pageUrl);
+    throwIfCancelled(jobId, abortSignal);
+    const { file, bufferLength } = await downloadPdf(resolvedPdfUrl, pageUrl, abortSignal);
     await pushLog(jobId, `PDFダウンロード完了 (${(bufferLength / 1024).toFixed(1)} KB)`);
 
-    const uploadResult = await uploadFileToOpenAI(file, apiKey);
-    const uploadedFileId = uploadResult && uploadResult.id;
-    if (!uploadedFileId) {
-      throw new Error("OpenAIがファイルIDを返しませんでした");
-    }
-    await pushLog(jobId, "OpenAIへファイルをアップロードしました");
-
-    let title;
-    let summary;
+    throwIfCancelled(jobId, abortSignal);
+    let uploadedFileId = null;
     try {
+      const uploadResult = await uploadFileToOpenAI(file, apiKey, abortSignal);
+      uploadedFileId = uploadResult && uploadResult.id;
+      if (!uploadedFileId) {
+        throw new Error("OpenAIがファイルIDを返しませんでした");
+      }
+      await pushLog(jobId, "OpenAIへファイルをアップロードしました");
+
+      throwIfCancelled(jobId, abortSignal);
+
       await pushLog(jobId, "タイトルを抽出しています...");
-      title = await requestTitle(uploadedFileId, model, apiKey);
+      const title = await requestTitle(uploadedFileId, model, apiKey, abortSignal);
       if (!title) {
         throw new Error("タイトルを取得できませんでした");
       }
       await pushLog(jobId, `タイトルを取得しました: ${title}`);
 
+      throwIfCancelled(jobId, abortSignal);
       await pushLog(jobId, "要約を生成しています...");
-      summary = await requestSummaryText(uploadedFileId, model, apiKey);
+      const summary = await requestSummaryText(uploadedFileId, model, apiKey, abortSignal);
       if (!summary) {
         throw new Error("要約を取得できませんでした");
       }
       await pushLog(jobId, `要約を取得しました (文字数: ${summary.length})`);
+
+      throwIfCancelled(jobId, abortSignal);
+      const scrapboxUrl = buildScrapboxUrl(scrapboxBase, project, title, summary);
+      await pushLog(jobId, "Scrapboxページを開きます...");
+      throwIfCancelled(jobId, abortSignal);
+      await openScrapboxTab(scrapboxUrl);
+      throwIfCancelled(jobId, abortSignal);
+      await pushLog(jobId, "処理が完了しました");
+
+      throwIfCancelled(jobId, abortSignal);
+      await markJobStatus(jobId, "success", {
+        result: {
+          title,
+          summaryLength: summary.length,
+          scrapboxUrl
+        }
+      });
     } finally {
-      await deleteUploadedFile(uploadedFileId, apiKey);
-      await pushLog(jobId, "OpenAIの一時ファイルを削除しました");
-    }
-
-    const scrapboxUrl = buildScrapboxUrl(scrapboxBase, project, title, summary);
-    await pushLog(jobId, "Scrapboxページを開きます...");
-    await openScrapboxTab(scrapboxUrl);
-    await pushLog(jobId, "処理が完了しました");
-
-    await markJobStatus(jobId, "success", {
-      result: {
-        title,
-        summaryLength: summary.length,
-        scrapboxUrl
+      if (uploadedFileId) {
+        await deleteUploadedFile(uploadedFileId, apiKey);
+        await pushLog(jobId, "OpenAIの一時ファイルを削除しました");
       }
-    });
+    }
   } catch (error) {
+    if (isAbortError(error)) {
+      const reason = (currentJob && currentJob.cancelReason) || DEFAULT_CANCEL_MESSAGE;
+      await pushLog(jobId, reason);
+      await markJobStatus(jobId, "aborted", { error: reason });
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     console.error("Summary flow failed", error);
     await pushLog(jobId, `エラー: ${message}`);
@@ -168,9 +252,18 @@ async function loadPersistedJob() {
     const job = stored[JOB_STORAGE_KEY] || null;
     if (job) {
       currentJob = job;
+      if (typeof currentJob.cancelRequested !== "boolean") {
+        currentJob.cancelRequested = false;
+      }
+      if (!currentJob.cancelReason) {
+        currentJob.cancelReason = null;
+      }
       if (job.status === "running") {
         ensureJobLogs();
         if (job.context && job.context.apiKey) {
+          currentJob.cancelRequested = false;
+          currentJob.cancelReason = null;
+          currentJobAbortController = new AbortController();
           currentJob.logs.push({
             timestamp: new Date().toISOString(),
             message: "サービスワーカー再起動のため処理を再開します"
@@ -178,7 +271,7 @@ async function loadPersistedJob() {
           await commitJob();
           (async () => {
             try {
-              await runSummaryFlow({ ...currentJob.context }, currentJob.id);
+              await runSummaryFlow({ ...currentJob.context }, currentJob.id, currentJobAbortController.signal);
             } catch (err) {
               const message = err instanceof Error ? err.message : String(err);
               await pushLog(currentJob.id, `エラー: ${message}`);
@@ -254,10 +347,15 @@ async function markJobStatus(jobId, status, extra = {}) {
   if (status !== "running" && currentJob.context) {
     currentJob.context.apiKey = null;
   }
+  if (status !== "running") {
+    currentJob.cancelRequested = false;
+    currentJob.cancelReason = null;
+    currentJobAbortController = null;
+  }
   await commitJob();
 }
 
-async function findPdfUrl(jobId, pageUrl) {
+async function findPdfUrl(jobId, pageUrl, abortSignal) {
   const direct = deriveDirectPdfUrl(pageUrl);
   if (direct) {
     await pushLog(jobId, `既知パターンからPDFを推定: ${direct}`);
@@ -267,7 +365,8 @@ async function findPdfUrl(jobId, pageUrl) {
   const response = await fetch(pageUrl, {
     method: "GET",
     headers: DEFAULT_HEADERS,
-    credentials: "include"
+    credentials: "include",
+    signal: abortSignal
   });
   if (!response.ok) {
     throw new Error(`ページ取得に失敗しました (status ${response.status})`);
@@ -431,7 +530,7 @@ function uniquePush(list, value) {
   }
 }
 
-async function downloadPdf(pdfUrl, referer) {
+async function downloadPdf(pdfUrl, referer, abortSignal) {
   const response = await fetch(pdfUrl, {
     method: "GET",
     credentials: "include",
@@ -440,7 +539,8 @@ async function downloadPdf(pdfUrl, referer) {
           ...DEFAULT_HEADERS,
           Referer: referer
         }
-      : DEFAULT_HEADERS
+      : DEFAULT_HEADERS,
+    signal: abortSignal
   });
   if (!response.ok) {
     throw new Error(`PDFダウンロードに失敗しました (status ${response.status})`);
@@ -467,7 +567,7 @@ function inferFilenameFromUrl(url) {
   return "paper.pdf";
 }
 
-async function uploadFileToOpenAI(file, apiKey) {
+async function uploadFileToOpenAI(file, apiKey, abortSignal) {
   const formData = new FormData();
   formData.append("purpose", "assistants");
   formData.append("file", file, file.name);
@@ -477,7 +577,8 @@ async function uploadFileToOpenAI(file, apiKey) {
     headers: {
       Authorization: `Bearer ${apiKey}`
     },
-    body: formData
+    body: formData,
+    signal: abortSignal
   });
 
   if (!response.ok) {
@@ -487,15 +588,29 @@ async function uploadFileToOpenAI(file, apiKey) {
   return response.json();
 }
 
-async function requestTitle(uploadedFileId, model, apiKey) {
+async function requestTitle(uploadedFileId, model, apiKey, abortSignal) {
   const prompt = await loadPromptFile("title_prompt.txt");
-  const titleText = await requestTextFromOpenAI(uploadedFileId, model, apiKey, prompt, "タイトル抽出");
+  const titleText = await requestTextFromOpenAI(
+    uploadedFileId,
+    model,
+    apiKey,
+    prompt,
+    "タイトル抽出",
+    abortSignal
+  );
   return titleText.split(/\r?\n/)[0].trim();
 }
 
-async function requestSummaryText(uploadedFileId, model, apiKey) {
+async function requestSummaryText(uploadedFileId, model, apiKey, abortSignal) {
   const prompt = await loadPromptFile("summarization_prompt.txt");
-  const rawText = await requestTextFromOpenAI(uploadedFileId, model, apiKey, prompt, "要約生成");
+  const rawText = await requestTextFromOpenAI(
+    uploadedFileId,
+    model,
+    apiKey,
+    prompt,
+    "要約生成",
+    abortSignal
+  );
   let summary = rawText.trim();
   if (summary.startsWith("{")) {
     try {
@@ -511,7 +626,7 @@ async function requestSummaryText(uploadedFileId, model, apiKey) {
   return summary;
 }
 
-async function requestTextFromOpenAI(uploadedFileId, model, apiKey, userPrompt, description) {
+async function requestTextFromOpenAI(uploadedFileId, model, apiKey, userPrompt, description, abortSignal) {
   const systemPrompt = "あなたは日本語で簡潔かつ正確に情報を伝える研究支援アシスタントです。指示された形式を厳守してください。";
 
   const response = await fetch("https://api.openai.com/v1/responses", {
@@ -535,7 +650,8 @@ async function requestTextFromOpenAI(uploadedFileId, model, apiKey, userPrompt, 
           ]
         }
       ],
-    })
+    }),
+    signal: abortSignal
   });
 
   if (!response.ok) {

@@ -44,6 +44,14 @@
         background-color: #94a3b8;
         cursor: progress;
       }
+      #cancel-button {
+        margin-top: 8px;
+        background-color: #c92a2a;
+      }
+      #cancel-button:disabled {
+        background-color: #f08c8c;
+        cursor: not-allowed;
+      }
       #job-state {
         font-size: 12px;
         margin-top: 8px;
@@ -113,6 +121,7 @@
       </div>
       <button type="submit">要約してScrapboxを開く</button>
     </form>
+    <button type="button" id="cancel-button" hidden>要約を中断する</button>
     <div id="job-state">準備完了</div>
     <div id="status" aria-live="polite"></div>
     <script src="popup.js"></script>
