@@ -1,15 +1,8 @@
-const DEFAULT_HEADERS = {
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-};
-
 const JOB_STORAGE_KEY = "paper_summary_current_job";
 const LOG_LIMIT = 200;
 const DEFAULT_CANCEL_MESSAGE = "ユーザーが処理を中断しました";
 
 let currentJob = null;
-let currentJobAbortController = null;
-const promptCache = {};
-const promptPromises = {};
 
 loadPersistedJob();
 
@@ -19,57 +12,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "start-summary") {
-    const payload = message.payload || {};
-    const { pageUrl, project, scrapboxBase, model, apiKey } = payload;
-    if (!pageUrl || !project || !scrapboxBase || !model || !apiKey) {
-      sendResponse({ ok: false, error: "必須項目が不足しています" });
-      return;
-    }
-
-    if (currentJob && currentJob.status === "running") {
-      sendResponse({ ok: false, error: "別の処理が進行中です" });
-      return;
-    }
-
-    const jobId = crypto.randomUUID();
-    currentJob = {
-      id: jobId,
-      status: "running",
-      logs: [],
-      startedAt: Date.now(),
-      updatedAt: Date.now(),
-      finishedAt: null,
-      error: null,
-      result: null,
-      cancelRequested: false,
-      cancelReason: null,
-      context: {
-        pageUrl,
-        pdfUrl: payload.pdfUrl || null,
-        project,
-        scrapboxBase,
-        model,
-        apiKey
-      }
-    };
-
-    currentJobAbortController = new AbortController();
-
-    (async () => {
-      try {
-        await commitJob();
-        await pushLog(jobId, "処理を開始しました");
-        await runSummaryFlow({ ...payload }, jobId, currentJobAbortController.signal);
-      } catch (err) {
-        const messageText = err instanceof Error ? err.message : String(err);
-        console.error("Unexpected failure while running summary flow", err);
-        await pushLog(jobId, `エラー: ${messageText}`);
-        await markJobStatus(jobId, "error", { error: messageText });
-      }
-    })();
-
-    sendResponse({ ok: true });
-    return;
+    handleStartMessage(message)
+      .then((result) => sendResponse(result))
+      .catch((error) => {
+        console.error("Failed to start summary job", error);
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      });
+    return true;
   }
 
   if (message.type === "get-status") {
@@ -78,221 +27,239 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "cancel-summary") {
-    if (!currentJob || currentJob.status !== "running") {
-      sendResponse({ ok: false, error: "進行中の処理はありません" });
-      return;
-    }
-    if (currentJob.cancelRequested) {
-      sendResponse({ ok: false, error: "既に中断要求を受け付けています" });
-      return;
-    }
-    currentJob.cancelRequested = true;
-    currentJob.cancelReason = DEFAULT_CANCEL_MESSAGE;
-    const jobId = currentJob.id;
-    (async () => {
-      await commitJob();
-      await pushLog(jobId, "ユーザーが処理の中断を要求しました");
-      if (currentJobAbortController) {
-        try {
-          currentJobAbortController.abort();
-        } catch (err) {
-          console.warn("Failed to abort current job", err);
-        }
-      }
-    })();
-    sendResponse({ ok: true });
-    return;
+    handleCancelMessage()
+      .then((result) => sendResponse(result))
+      .catch((error) => {
+        console.error("Failed to cancel summary job", error);
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      });
+    return true;
   }
 
   if (message.type === "clear-status") {
     currentJob = null;
-    currentJobAbortController = null;
     chrome.storage.local.remove(JOB_STORAGE_KEY).finally(() => {
       broadcastJobUpdate();
     });
     sendResponse({ ok: true });
     return;
   }
+
+  if (message.type === "offscreen-log") {
+    handleOffscreenLog(message)
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => {
+        console.error("Failed to handle offscreen log", error);
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      });
+    return true;
+  }
+
+  if (message.type === "offscreen-result") {
+    handleOffscreenResult(message)
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => {
+        console.error("Failed to handle offscreen result", error);
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      });
+    return true;
+  }
 });
 
-function createAbortError(message) {
-  const error = new Error(message || DEFAULT_CANCEL_MESSAGE);
-  error.name = "AbortError";
-  return error;
-}
+async function handleStartMessage(message) {
+  const payload = message.payload || {};
+  const { pageUrl, project, scrapboxBase, model, apiKey } = payload;
+  if (!pageUrl || !project || !scrapboxBase || !model || !apiKey) {
+    return { ok: false, error: "必須項目が不足しています" };
+  }
 
-function isAbortError(error) {
-  if (!error) {
-    return false;
+  if (currentJob && currentJob.status === "running") {
+    return { ok: false, error: "別の処理が進行中です" };
   }
-  if (error.name === "AbortError") {
-    return true;
-  }
-  if (typeof DOMException !== "undefined" && error instanceof DOMException && error.name === "AbortError") {
-    return true;
-  }
-  return false;
-}
 
-function throwIfCancelled(jobId, abortSignal) {
-  if (abortSignal && abortSignal.aborted) {
-    throw createAbortError(DEFAULT_CANCEL_MESSAGE);
-  }
-  if (!currentJob || currentJob.id !== jobId) {
-    return;
-  }
-  if (currentJob.cancelRequested) {
-    throw createAbortError(currentJob.cancelReason || DEFAULT_CANCEL_MESSAGE);
-  }
-}
-
-async function runSummaryFlow(options, jobId, abortSignal) {
-  try {
-    const {
+  const jobId = crypto.randomUUID();
+  currentJob = {
+    id: jobId,
+    status: "running",
+    logs: [],
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+    finishedAt: null,
+    error: null,
+    result: null,
+    cancelRequested: false,
+    cancelReason: null,
+    context: {
       pageUrl,
-      pdfUrl,
+      pdfUrl: payload.pdfUrl || null,
       project,
       scrapboxBase,
       model,
       apiKey
-    } = options;
-
-    throwIfCancelled(jobId, abortSignal);
-
-    let resolvedPdfUrl = null;
-    if (pdfUrl && pdfUrl.trim()) {
-      try {
-        resolvedPdfUrl = new URL(pdfUrl, pageUrl).toString();
-      } catch (err) {
-        throw new Error("指定されたPDF URLを正しく解釈できませんでした");
-      }
-      await pushLog(jobId, `指定されたPDF URLを使用します: ${resolvedPdfUrl}`);
-    } else {
-      if (looksLikePdf(pageUrl)) {
-        resolvedPdfUrl = pageUrl;
-        await pushLog(jobId, "ページURL自体がPDFのため、そのまま使用します");
-      } else {
-        await pushLog(jobId, "PDFリンクを解析しています...");
-        throwIfCancelled(jobId, abortSignal);
-        resolvedPdfUrl = await findPdfUrl(jobId, pageUrl, abortSignal);
-        await pushLog(jobId, `PDF URLを推定しました: ${resolvedPdfUrl}`);
-      }
     }
+  };
 
-    throwIfCancelled(jobId, abortSignal);
-    const { file, bufferLength } = await downloadPdf(resolvedPdfUrl, pageUrl, abortSignal);
-    await pushLog(jobId, `PDFダウンロード完了 (${(bufferLength / 1024).toFixed(1)} KB)`);
+  await commitJob();
+  await pushLog(jobId, "処理を開始しました");
 
-    throwIfCancelled(jobId, abortSignal);
-    let uploadedFileId = null;
-    try {
-      const uploadResult = await uploadFileToOpenAI(file, apiKey, abortSignal);
-      uploadedFileId = uploadResult && uploadResult.id;
-      if (!uploadedFileId) {
-        throw new Error("OpenAIがファイルIDを返しませんでした");
-      }
-      await pushLog(jobId, "OpenAIへファイルをアップロードしました");
-
-      throwIfCancelled(jobId, abortSignal);
-
-      await pushLog(jobId, "タイトルを抽出しています...");
-      const title = await requestTitle(uploadedFileId, model, apiKey, abortSignal);
-      if (!title) {
-        throw new Error("タイトルを取得できませんでした");
-      }
-      await pushLog(jobId, `タイトルを取得しました: ${title}`);
-
-      throwIfCancelled(jobId, abortSignal);
-      await pushLog(jobId, "要約を生成しています...");
-      const summary = await requestSummaryText(uploadedFileId, model, apiKey, abortSignal);
-      if (!summary) {
-        throw new Error("要約を取得できませんでした");
-      }
-      await pushLog(jobId, `要約を取得しました (文字数: ${summary.length})`);
-
-      throwIfCancelled(jobId, abortSignal);
-      const scrapboxUrl = buildScrapboxUrl(scrapboxBase, project, title, summary);
-      await pushLog(jobId, "Scrapboxページを開きます...");
-      throwIfCancelled(jobId, abortSignal);
-      await openScrapboxTab(scrapboxUrl);
-      throwIfCancelled(jobId, abortSignal);
-      await pushLog(jobId, "処理が完了しました");
-
-      throwIfCancelled(jobId, abortSignal);
-      await markJobStatus(jobId, "success", {
-        result: {
-          title,
-          summaryLength: summary.length,
-          scrapboxUrl
-        }
-      });
-    } finally {
-      if (uploadedFileId) {
-        await deleteUploadedFile(uploadedFileId, apiKey);
-        await pushLog(jobId, "OpenAIの一時ファイルを削除しました");
-      }
+  try {
+    await ensureOffscreenDocument();
+    const response = await sendToOffscreen({
+      type: "offscreen-start",
+      jobId,
+      context: currentJob.context
+    });
+    if (!response || !response.ok) {
+      throw new Error(response?.error || "オフスクリーン文書に処理を依頼できませんでした");
     }
+    return { ok: true };
   } catch (error) {
-    if (isAbortError(error)) {
-      const reason = (currentJob && currentJob.cancelReason) || DEFAULT_CANCEL_MESSAGE;
-      await pushLog(jobId, reason);
-      await markJobStatus(jobId, "aborted", { error: reason });
+    const messageText = error instanceof Error ? error.message : String(error);
+    await pushLog(jobId, `エラー: ${messageText}`);
+    await markJobStatus(jobId, "error", { error: messageText });
+    throw error;
+  }
+}
+
+async function handleCancelMessage() {
+  if (!currentJob || currentJob.status !== "running") {
+    return { ok: false, error: "進行中の処理はありません" };
+  }
+  if (currentJob.cancelRequested) {
+    return { ok: false, error: "既に中断要求を受け付けています" };
+  }
+  currentJob.cancelRequested = true;
+  currentJob.cancelReason = DEFAULT_CANCEL_MESSAGE;
+  await commitJob();
+  await pushLog(currentJob.id, "ユーザーが処理の中断を要求しました");
+  try {
+    await sendToOffscreen({ type: "offscreen-cancel", jobId: currentJob.id });
+  } catch (error) {
+    console.warn("Failed to notify offscreen worker about cancellation", error);
+  }
+  return { ok: true };
+}
+
+async function handleOffscreenLog(message) {
+  if (!currentJob || currentJob.id !== message.jobId) {
+    return;
+  }
+  await pushLog(message.jobId, message.message || "");
+}
+
+async function handleOffscreenResult(message) {
+  const { jobId, status, payload = {} } = message;
+  if (!currentJob || currentJob.id !== jobId) {
+    return;
+  }
+
+  if (status === "success") {
+    if (payload.scrapboxUrl) {
+      try {
+        await openScrapboxTab(payload.scrapboxUrl);
+      } catch (err) {
+        console.error("Failed to open Scrapbox tab", err);
+        await pushLog(jobId, "Scrapboxタブの起動に失敗しました");
+      }
+    }
+    await markJobStatus(jobId, "success", {
+      result: {
+        title: payload.title,
+        summaryLength: payload.summaryLength,
+        scrapboxUrl: payload.scrapboxUrl
+      }
+    });
+    return;
+  }
+
+  const errorMessage = payload.error || DEFAULT_CANCEL_MESSAGE;
+
+  if (status === "aborted") {
+    currentJob.cancelRequested = true;
+    currentJob.cancelReason = errorMessage;
+    await markJobStatus(jobId, "aborted", { error: errorMessage });
+    return;
+  }
+
+  await markJobStatus(jobId, "error", { error: errorMessage });
+}
+
+async function ensureOffscreenDocument() {
+  if (!chrome.offscreen || !chrome.offscreen.createDocument) {
+    throw new Error("offscreen API を利用できません");
+  }
+  if (chrome.offscreen.hasDocument) {
+    const hasDocument = await chrome.offscreen.hasDocument();
+    if (hasDocument) {
       return;
     }
-    const message = error instanceof Error ? error.message : String(error);
-    console.error("Summary flow failed", error);
-    await pushLog(jobId, `エラー: ${message}`);
-    await markJobStatus(jobId, "error", { error: message });
   }
+  await chrome.offscreen.createDocument({
+    url: "offscreen.html",
+    reasons: ["WORKERS"],
+    justification: "長時間の要約処理をバックグラウンドで継続するため"
+  });
+}
+
+function sendToOffscreen(message) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(message, (response) => {
+      const maybeError = chrome.runtime.lastError;
+      if (maybeError) {
+        reject(maybeError);
+        return;
+      }
+      resolve(response);
+    });
+  });
 }
 
 async function loadPersistedJob() {
   try {
     const stored = await chrome.storage.local.get(JOB_STORAGE_KEY);
     const job = stored[JOB_STORAGE_KEY] || null;
-    if (job) {
-      currentJob = job;
-      if (typeof currentJob.cancelRequested !== "boolean") {
+    if (!job) {
+      return;
+    }
+    currentJob = job;
+    ensureJobLogs();
+
+    if (job.status === "running") {
+      if (job.context && job.context.apiKey) {
         currentJob.cancelRequested = false;
-      }
-      if (!currentJob.cancelReason) {
         currentJob.cancelReason = null;
-      }
-      if (job.status === "running") {
-        ensureJobLogs();
-        if (job.context && job.context.apiKey) {
-          currentJob.cancelRequested = false;
-          currentJob.cancelReason = null;
-          currentJobAbortController = new AbortController();
-          currentJob.logs.push({
-            timestamp: new Date().toISOString(),
-            message: "サービスワーカー再起動のため処理を再開します"
+        currentJob.logs.push({
+          timestamp: new Date().toISOString(),
+          message: "サービスワーカーが再起動しましたが処理は継続中です"
+        });
+        await commitJob();
+        try {
+          await ensureOffscreenDocument();
+          await sendToOffscreen({
+            type: "offscreen-start",
+            jobId: currentJob.id,
+            context: currentJob.context,
+            resume: true
           });
-          await commitJob();
-          (async () => {
-            try {
-              await runSummaryFlow({ ...currentJob.context }, currentJob.id, currentJobAbortController.signal);
-            } catch (err) {
-              const message = err instanceof Error ? err.message : String(err);
-              await pushLog(currentJob.id, `エラー: ${message}`);
-              await markJobStatus(currentJob.id, "error", { error: message });
-            }
-          })();
-        } else {
-          currentJob.status = "aborted";
-          currentJob.error = "サービスワーカー再起動時に再開に必要な情報が不足していました。もう一度実行してください。";
-          currentJob.logs.push({
-            timestamp: new Date().toISOString(),
-            message: currentJob.error
-          });
-          await commitJob();
+        } catch (error) {
+          const messageText = error instanceof Error ? error.message : String(error);
+          await pushLog(currentJob.id, `エラー: ${messageText}`);
+          await markJobStatus(currentJob.id, "error", { error: messageText });
         }
       } else {
-        broadcastJobUpdate();
+        currentJob.status = "aborted";
+        currentJob.error = "サービスワーカー再起動時に再開に必要な情報が不足していました。もう一度実行してください。";
+        currentJob.logs.push({
+          timestamp: new Date().toISOString(),
+          message: currentJob.error
+        });
+        await commitJob();
       }
+    } else {
+      broadcastJobUpdate();
     }
-  } catch (err) {
-    console.error("ジョブ状態の復元に失敗しました", err);
+  } catch (error) {
+    console.error("ジョブ状態の復元に失敗しました", error);
   }
 }
 
@@ -316,7 +283,7 @@ function broadcastJobUpdate() {
   try {
     chrome.runtime.sendMessage({ type: "job-update", job: currentJob }).catch(() => {});
   } catch (err) {
-    // ignore when no listeners are active
+    // listener が存在しない場合は無視
   }
 }
 
@@ -345,395 +312,20 @@ async function markJobStatus(jobId, status, extra = {}) {
     currentJob.result = null;
   }
   if (status !== "running" && currentJob.context) {
-    currentJob.context.apiKey = null;
+    if (status !== "running") {
+      currentJob.context.apiKey = null;
+    }
   }
   if (status !== "running") {
     currentJob.cancelRequested = false;
     currentJob.cancelReason = null;
-    currentJobAbortController = null;
   }
   await commitJob();
 }
 
-async function findPdfUrl(jobId, pageUrl, abortSignal) {
-  const direct = deriveDirectPdfUrl(pageUrl);
-  if (direct) {
-    await pushLog(jobId, `既知パターンからPDFを推定: ${direct}`);
-    return direct;
-  }
-
-  const response = await fetch(pageUrl, {
-    method: "GET",
-    headers: DEFAULT_HEADERS,
-    credentials: "include",
-    signal: abortSignal
-  });
-  if (!response.ok) {
-    throw new Error(`ページ取得に失敗しました (status ${response.status})`);
-  }
-  const html = await response.text();
-  const pdfCandidates = [];
-
-  const anchorRegex = /<a\b[^>]*href\s*=\s*("([^"]*)"|'([^']*)'|([^\s"'>]+))[^>]*>(.*?)<\/a>/gis;
-  for (const match of html.matchAll(anchorRegex)) {
-    const href = match[2] || match[3] || match[4] || "";
-    const rawAnchor = match[0] || "";
-    const anchorText = stripTags(match[5] || "");
-    const typeAttr = (extractAttribute(rawAnchor, "type") || "").toLowerCase();
-    if (!href) {
-      continue;
-    }
-    let resolved;
-    try {
-      resolved = new URL(href, pageUrl).toString();
-    } catch (err) {
-      continue;
-    }
-    if (looksLikePdf(resolved, anchorText, typeAttr)) {
-      if (resolved.toLowerCase().endsWith(".pdf")) {
-        return resolved;
-      }
-      uniquePush(pdfCandidates, resolved);
-    }
-  }
-
-  const metaRegex = /<meta\b[^>]*name\s*=\s*("citation_pdf_url"|'citation_pdf_url')[^>]*>/gi;
-  for (const metaMatch of html.matchAll(metaRegex)) {
-    const tag = metaMatch[0];
-    const content = extractAttribute(tag, "content");
-    if (!content) {
-      continue;
-    }
-    try {
-      const resolved = new URL(content, pageUrl).toString();
-      if (resolved.toLowerCase().endsWith(".pdf")) {
-        return resolved;
-      }
-      uniquePush(pdfCandidates, resolved);
-    } catch (err) {
-      // ignore invalid URL
-    }
-  }
-
-  const linkRegex = /<link\b[^>]*>/gi;
-  for (const linkMatch of html.matchAll(linkRegex)) {
-    const tag = linkMatch[0];
-    const typeAttr = (extractAttribute(tag, "type") || "").toLowerCase();
-    if (typeAttr !== "application/pdf") {
-      continue;
-    }
-    const href = extractAttribute(tag, "href");
-    if (!href) {
-      continue;
-    }
-    try {
-      const resolved = new URL(href, pageUrl).toString();
-      if (resolved.toLowerCase().endsWith(".pdf")) {
-        return resolved;
-      }
-      uniquePush(pdfCandidates, resolved);
-    } catch (err) {
-      // ignore invalid URL
-    }
-  }
-
-  if (pdfCandidates.length > 0) {
-    return pdfCandidates[0];
-  }
-
-  throw new Error("PDFリンクを検出できませんでした");
-}
-
-function extractAttribute(tag, name) {
-  const regex = new RegExp(`${name}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s"'>]+))`, "i");
-  const match = tag.match(regex);
-  if (!match) {
-    return "";
-  }
-  return match[2] || match[3] || match[4] || "";
-}
-
-function stripTags(html) {
-  return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function deriveDirectPdfUrl(pageUrl) {
-  let parsed;
-  try {
-    parsed = new URL(pageUrl);
-  } catch (err) {
-    return null;
-  }
-  const host = (parsed.hostname || "").toLowerCase();
-  const path = parsed.pathname || "";
-
-  if (host.endsWith("arxiv.org") && path.startsWith("/abs/")) {
-    const identifier = path.replace(/^\/abs\//, "").replace(/\/$/, "");
-    if (identifier) {
-      const suffix = identifier.endsWith(".pdf") ? "" : ".pdf";
-      return `${parsed.origin}/pdf/${identifier}${suffix}`;
-    }
-  }
-
-  if (host.endsWith("aclanthology.org")) {
-    const normalized = path.replace(/\/$/, "");
-    if (normalized) {
-      return `${parsed.origin}${normalized}.pdf`;
-    }
-  }
-
-  if (host.endsWith("openreview.net")) {
-    const id = parsed.searchParams.get("id");
-    if (id) {
-      return `${parsed.origin}/pdf?id=${id}`;
-    }
-  }
-
-  if (host === "dl.acm.org" && path.includes("/doi/")) {
-    const doiPart = path.split("/doi/").pop();
-    if (doiPart) {
-      return `${parsed.origin}/doi/pdf/${doiPart}?download=true`;
-    }
-  }
-
-  return null;
-}
-
-function looksLikePdf(url, anchorText = "", mimeType = "") {
-  const lowerUrl = url.toLowerCase();
-  const lowerText = (anchorText || "").toLowerCase();
-  const lowerMime = (mimeType || "").toLowerCase();
-  if (lowerUrl.endsWith(".pdf")) {
-    return true;
-  }
-  if (lowerMime === "application/pdf") {
-    return true;
-  }
-  if (lowerUrl.includes(".pdf")) {
-    return true;
-  }
-  if (lowerUrl.includes("/pdf/")) {
-    return true;
-  }
-  if (lowerUrl.includes("format=pdf") || lowerUrl.includes("download=1")) {
-    return true;
-  }
-  if (lowerText.includes("pdf")) {
-    return true;
-  }
-  return false;
-}
-
-function uniquePush(list, value) {
-  if (!list.includes(value)) {
-    list.push(value);
-  }
-}
-
-async function downloadPdf(pdfUrl, referer, abortSignal) {
-  const response = await fetch(pdfUrl, {
-    method: "GET",
-    credentials: "include",
-    headers: referer
-      ? {
-          ...DEFAULT_HEADERS,
-          Referer: referer
-        }
-      : DEFAULT_HEADERS,
-    signal: abortSignal
-  });
-  if (!response.ok) {
-    throw new Error(`PDFダウンロードに失敗しました (status ${response.status})`);
-  }
-  const buffer = await response.arrayBuffer();
-  if (!buffer || buffer.byteLength === 0) {
-    throw new Error("PDFデータが空でした");
-  }
-  const filename = inferFilenameFromUrl(pdfUrl);
-  const file = new File([buffer], filename, { type: "application/pdf" });
-  return { file, bufferLength: buffer.byteLength };
-}
-
-function inferFilenameFromUrl(url) {
-  try {
-    const parsed = new URL(url);
-    const segments = parsed.pathname.split("/").filter(Boolean);
-    if (segments.length > 0) {
-      return segments[segments.length - 1] || "paper.pdf";
-    }
-  } catch (err) {
-    // ignore
-  }
-  return "paper.pdf";
-}
-
-async function uploadFileToOpenAI(file, apiKey, abortSignal) {
-  const formData = new FormData();
-  formData.append("purpose", "assistants");
-  formData.append("file", file, file.name);
-
-  const response = await fetch("https://api.openai.com/v1/files", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: formData,
-    signal: abortSignal
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`ファイルアップロード失敗: ${response.status} ${text}`);
-  }
-  return response.json();
-}
-
-async function requestTitle(uploadedFileId, model, apiKey, abortSignal) {
-  const prompt = await loadPromptFile("title_prompt.txt");
-  const titleText = await requestTextFromOpenAI(
-    uploadedFileId,
-    model,
-    apiKey,
-    prompt,
-    "タイトル抽出",
-    abortSignal
-  );
-  return titleText.split(/\r?\n/)[0].trim();
-}
-
-async function requestSummaryText(uploadedFileId, model, apiKey, abortSignal) {
-  const prompt = await loadPromptFile("summarization_prompt.txt");
-  const rawText = await requestTextFromOpenAI(
-    uploadedFileId,
-    model,
-    apiKey,
-    prompt,
-    "要約生成",
-    abortSignal
-  );
-  let summary = rawText.trim();
-  if (summary.startsWith("{")) {
-    try {
-      const parsed = JSON.parse(summary);
-      const summaryField = (parsed.summary || "").trim();
-      if (summaryField) {
-        summary = summaryField;
-      }
-    } catch (err) {
-      console.warn("要約レスポンスのJSON解析に失敗しました", err);
-    }
-  }
-  return summary;
-}
-
-async function requestTextFromOpenAI(uploadedFileId, model, apiKey, userPrompt, description, abortSignal) {
-  const systemPrompt = "あなたは日本語で簡潔かつ正確に情報を伝える研究支援アシスタントです。指示された形式を厳守してください。";
-
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model,
-      input: [
-        {
-          role: "system",
-          content: [{ type: "input_text", text: systemPrompt }]
-        },
-        {
-          role: "user",
-          content: [
-            { type: "input_text", text: userPrompt },
-            { type: "input_file", file_id: uploadedFileId }
-          ]
-        }
-      ],
-    }),
-    signal: abortSignal
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`${description}リクエスト失敗: ${response.status} ${text}`);
-  }
-  const responseObject = await response.json();
-  const text = extractTextFromResponse(responseObject).trim();
-  if (!text) {
-    throw new Error(`${description}の結果が空でした`);
-  }
-  return text;
-}
-
-function extractTextFromResponse(responseObject) {
-  const chunks = [];
-  if (responseObject && Array.isArray(responseObject.output)) {
-    for (const item of responseObject.output) {
-      if (!item || !Array.isArray(item.content)) {
-        continue;
-      }
-      for (const content of item.content) {
-        if (content && content.type === "output_text" && content.text) {
-          chunks.push(content.text);
-        }
-      }
-    }
-  }
-  if (chunks.length === 0 && responseObject && responseObject.output_text) {
-    chunks.push(responseObject.output_text);
-  }
-  return chunks.map((chunk) => chunk.trim()).filter(Boolean).join("\n").trim();
-}
-
-async function deleteUploadedFile(fileId, apiKey) {
-  try {
-    await fetch(`https://api.openai.com/v1/files/${fileId}`, {
-      method: "DELETE",
-      headers: {
-        Authorization: `Bearer ${apiKey}`
-      }
-    });
-  } catch (err) {
-    console.warn("OpenAIファイル削除に失敗しました", err);
-  }
-}
-
-function sanitizeBaseUrl(value) {
-  return value.replace(/\/$/, "");
-}
-
-function buildScrapboxUrl(baseUrl, project, title, summary) {
-  const trimmedBase = sanitizeBaseUrl(baseUrl);
-  const encodedProject = encodeURIComponent(project);
-  const encodedTitle = encodeURIComponent(title);
-  const bodyText = (summary || "").trim();
-  const encodedBody = encodeURIComponent(bodyText);
-  return `${trimmedBase}/${encodedProject}/${encodedTitle}?body=${encodedBody}`;
-}
-
 async function openScrapboxTab(url) {
+  if (!url) {
+    return;
+  }
   await chrome.tabs.create({ url });
-}
-
-async function loadPromptFile(filename) {
-  if (promptCache[filename]) {
-    return promptCache[filename];
-  }
-  if (!promptPromises[filename]) {
-    promptPromises[filename] = (async () => {
-      const url = chrome.runtime.getURL(filename);
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`${filename} の読み込みに失敗しました (status ${response.status})`);
-      }
-      const text = (await response.text()).trim();
-      if (!text) {
-        throw new Error(`${filename} が空です`);
-      }
-      promptCache[filename] = text;
-      return text;
-    })();
-  }
-  return promptPromises[filename];
 }
