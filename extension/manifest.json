@@ -3,11 +3,18 @@
   "name": "Paper Summary to Scrapbox",
   "description": "論文ページからPDFを取得し、OpenAIで要約してScrapboxページを開くローカル専用拡張",
   "version": "0.1.0",
-  "permissions": ["storage", "scripting", "activeTab", "tabs"],
+  "permissions": ["storage", "scripting", "activeTab", "tabs", "offscreen"],
   "host_permissions": [
     "https://*/*",
     "http://*/*",
     "https://api.openai.com/*"
+  ],
+  "offscreen_documents": [
+    {
+      "url": "offscreen.html",
+      "reasons": ["WORKERS"],
+      "justification": "長時間の要約処理をバックグラウンドで継続するため"
+    }
   ],
   "background": {
     "service_worker": "background.js"
